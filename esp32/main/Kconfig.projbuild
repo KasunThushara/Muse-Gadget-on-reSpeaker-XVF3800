@@ -374,15 +374,32 @@ menu "ESP32 Device SDK"
             the internal one.
 
     config HOMEHUB_BUTTON_GPIO
-        int "Active-low setup/reset button GPIO"
+        int "Setup/reset button GPIO"
         range 0 28 if IDF_TARGET_ESP32C5
         range 0 48
         default 28 if IDF_TARGET_ESP32C5
         default 41
         help
             GPIO connected to the button, independently of the status LED.
-            Uses an internal pull-up and treats a low level as pressed.
-            Muse Home Link and the ESP32-C5 DevKitC-1 BOOT button both use GPIO28.
+            Active low with an internal pull-up unless HOMEHUB_BUTTON_ACTIVE_HIGH
+            is set. Muse Home Link and the ESP32-C5 DevKitC-1 BOOT button both
+            use GPIO28.
+
+    config HOMEHUB_BUTTON_ACTIVE_HIGH
+        bool "Button is active high"
+        default n
+        help
+            The button pulls the GPIO high when pressed, for example a Grove
+            Button module. The default is active low with an internal pull-up.
+
+    config HOMEHUB_BUTTON_POWER_GPIO
+        int "GPIO that powers the button module (-1 = none)"
+        range -1 48
+        default -1
+        help
+            Some button modules need VCC. If their VCC is wired to a GPIO
+            instead of 3V3, set that GPIO here and the firmware drives it high
+            at startup. Leave -1 when VCC is on the 3V3 rail.
 
     config HOMEHUB_BUTTON_LABEL
         string "Button label shown in status prompts"
@@ -407,6 +424,8 @@ menu "ESP32 Device SDK"
             along the top and bottom edges, with an animation in between. The
             Home Assistant Voice PE shows the status colour on its LED ring.
             Seeed reSpeaker Lite shows it on a single RGB LED.
+            The Seeed reSpeaker XVF3800 shows it on its 12-LED ring, set
+            through I2C by the XVF3800 itself.
             The reTerminal E1001 and E1002 show a still status screen on
             their e-paper instead (black and white on the E1001, six colours
             on the E1002).
@@ -463,6 +482,14 @@ menu "ESP32 Device SDK"
         config HOMEHUB_LED_BACKEND_RESPEAKER_LITE
             bool "Seeed reSpeaker Lite single RGB LED (experimental)"
             depends on IDF_TARGET_ESP32S3
+
+        config HOMEHUB_LED_BACKEND_XVF3800
+            bool "Seeed reSpeaker XVF3800 12-LED ring over I2C (experimental)"
+            depends on IDF_TARGET_ESP32S3
+            help
+                The reSpeaker XVF3800 drives its own 12-LED WS2812 ring; the
+                ESP32-S3 sets the effect, colour and brightness over I2C
+                instead of driving the LEDs directly.
 
         config HOMEHUB_LED_BACKEND_MUSE
             bool "Muse display"
@@ -525,11 +552,11 @@ menu "ESP32 Device SDK"
 
     config HOMEHUB_VOICE
         bool "Push-to-talk voice chat"
-        depends on (HOMEHUB_LED_BACKEND_VOICE_RING || HOMEHUB_LED_BACKEND_RESPEAKER_LITE) && SPIRAM
+        depends on (HOMEHUB_LED_BACKEND_VOICE_RING || HOMEHUB_LED_BACKEND_RESPEAKER_LITE || HOMEHUB_LED_BACKEND_XVF3800) && SPIRAM
         default y
         help
-            Hold the centre button (XIAO BOOT on reSpeaker Lite), speak,
-            release: the audio goes to the agent's chat as a voice note,
+            Hold the centre button (XIAO BOOT on reSpeaker Lite and XVF3800),
+            speak, release: the audio goes to the agent's chat as a voice note,
             which the VM transcribes, and the
             reply appears in the Muse app as text. To speak it, plug a TTS
             API of your own into start_tts in muse_chat_session.cpp. This

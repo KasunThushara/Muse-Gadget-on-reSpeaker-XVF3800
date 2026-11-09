@@ -53,6 +53,8 @@ static const char *TAG = "link.voice";
 
 #define CAPTURE_MAX_MS      15000
 #define CAPTURE_MIN_MS      300
+// A press shorter than this starts a live call; a longer hold is a voice note.
+#define TAP_MAX_MS          1000
 #define CAPTURE_CHUNK       (VOICE_MIC_RATE / 50)      // 20 ms
 #define CAPTURE_MAX         (VOICE_MIC_RATE * CAPTURE_MAX_MS / 1000)
 // Keep listening briefly after release so the last word is not clipped.
@@ -117,15 +119,18 @@ static bool pressed_again(TickType_t wait) {
 
 // Stream the microphone into the turn until release (plus a tail) or the
 // limit. Returns the number of samples, 0 if the capture failed.
-static size_t record(void) {
+static size_t record(int64_t *press_us) {
     static int16_t chunk[CAPTURE_CHUNK];
     if (voice_board_mic_start() != ESP_OK) return 0;
     size_t samples = 0;
+    int64_t press_start = esp_timer_get_time();
+    int64_t release_at = 0;
     int64_t stop_at = 0;
     while (samples < CAPTURE_MAX) {
         voice_evt_t evt;
         if (!stop_at && xQueueReceive(s_events, &evt, 0) == pdTRUE && evt == EVT_RELEASE) {
-            stop_at = esp_timer_get_time() + RELEASE_TAIL_MS * 1000LL;
+            release_at = esp_timer_get_time();
+            stop_at = release_at + RELEASE_TAIL_MS * 1000LL;
         }
         if (stop_at && esp_timer_get_time() >= stop_at) break;
         int peak = 0;
@@ -136,6 +141,7 @@ static size_t record(void) {
         led_status_set_level(peak / 12000.0f);
     }
     voice_board_mic_stop();
+    if (press_us) *press_us = release_at > press_start ? release_at - press_start : 0;
     if (samples >= CAPTURE_MAX) ESP_LOGI(TAG, "capture limit reached");
     return samples;
 }
@@ -333,8 +339,12 @@ static bool run_turn(void) {
     led_status_set_level(0);
     led_status_set_voice(LED_VOICE_LISTENING);
     muse_hatch_turn_begin();
-    size_t samples = record();
-    if (samples < VOICE_MIC_RATE * CAPTURE_MIN_MS / 1000) {
+    int64_t press_us = 0;
+    size_t samples = record(&press_us);
+    // A tap starts a live call. The captured sample count includes the release
+    // tail, so use the measured press length for this decision.
+    bool tap = press_us > 0 && press_us < (int64_t)TAP_MAX_MS * 1000;
+    if (samples < VOICE_MIC_RATE * CAPTURE_MIN_MS / 1000 || tap) {
         muse_hatch_turn_cancel();
         if (!samples) return fail("microphone unavailable");
 #if CONFIG_MUSE_REALTIME_VOICE

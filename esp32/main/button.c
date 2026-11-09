@@ -26,10 +26,18 @@
 static const char *TAG = "link.button";
 
 #define BTN_GPIO           CONFIG_HOMEHUB_BUTTON_GPIO
+#if CONFIG_HOMEHUB_BUTTON_ACTIVE_HIGH
+#define BTN_PRESSED_LEVEL  1
+#else
+#define BTN_PRESSED_LEVEL  0
+#endif
+#if defined(CONFIG_HOMEHUB_BUTTON_POWER_GPIO) && CONFIG_HOMEHUB_BUTTON_POWER_GPIO >= 0
+#define BTN_POWER_GPIO     CONFIG_HOMEHUB_BUTTON_POWER_GPIO
+#endif
 #define LONG_PRESS_MS      5000
 #define SHORT_PRESS_MAX_MS 1000
 #define DOUBLE_CLICK_MS    400
-#define POLL_MS            50
+#define POLL_MS            20
 
 static button_cb s_short_press_cb = NULL;
 static button_cb s_double_press_cb = NULL;
@@ -54,7 +62,7 @@ static void button_task(void *arg) {
 #endif
 
     while (1) {
-        bool pressed = (gpio_get_level(BTN_GPIO) == 0);
+        bool pressed = (gpio_get_level(BTN_GPIO) == BTN_PRESSED_LEVEL);
 
         if (pressed && !was_pressed) {
             press_start = esp_timer_get_time();
@@ -114,11 +122,25 @@ bool button_init(button_cb on_short_press, button_cb on_double_press,
     s_double_press_cb = on_double_press;
     s_long_press_cb = on_long_press;
 
+#ifdef BTN_POWER_GPIO
+    // Some button modules (for example Grove Button) take VCC from a GPIO.
+    gpio_config_t power_cfg = {
+        .pin_bit_mask = 1ULL << BTN_POWER_GPIO,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    if (gpio_config(&power_cfg) == ESP_OK) gpio_set_level(BTN_POWER_GPIO, 1);
+#endif
+
     gpio_config_t cfg = {
         .pin_bit_mask = (1ULL << BTN_GPIO),
         .mode = GPIO_MODE_INPUT,
+#if CONFIG_HOMEHUB_BUTTON_ACTIVE_HIGH
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_ENABLE,
+#else
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
+#endif
         .intr_type = GPIO_INTR_DISABLE,
     };
     esp_err_t err = gpio_config(&cfg);

@@ -57,6 +57,7 @@
 #include "esp_attr.h"
 #include "esp_crt_bundle.h"
 #include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -288,6 +289,11 @@ static char s_reply_shown[EV_TEXT];   /* the pre-speech caption last sent */
 static void mark(mark_t m);
 static bool open_note(void);
 static void log_marks(void);
+#if defined(CONFIG_MUSE_TTS_ENABLE) && CONFIG_MUSE_TTS_ENABLE
+static void tts_data(const uint8_t *data, size_t len);
+static esp_err_t on_tts_http(esp_http_client_event_t *evt);
+static void tts_play_wav(const uint8_t *buf, size_t len);
+#endif
 static int16_t *s_pcm;       /* MINIMP3_MAX_SAMPLES_PER_FRAME */
 static int16_t *s_pcm16;     /* resampled output */
 static int64_t s_last_seq;
@@ -1593,29 +1599,101 @@ static void start_tts(void)
         if (m.tts != TTS_QUEUED) {
             continue;
         }
-        /*
-         * Replies are text, shown at reading pace: silence in place of speech
-         * paces the captions and ends the turn. To speak them instead, send
-         * the message's text (s_turn.texts + i * TEXT_MAX, if texts was
-         * allocated; up to TEXT_MAX - 1 bytes) to a TTS API of your choice and
-         * play the MP3 it returns. In place of the silence below: keep
-         * m.tts = TTS_ACTIVE and s_turn.tts_msg = i, set s_turn.silent = false,
-         * m.pcm_start = s_turn.pcm_out, m.pcm_frames = 0, s_turn.mp3_len = 0,
-         * s_turn.mp3_ended = false, s_turn.kbps = 0, s_turn.down_rate = 0 and
-         * mp3dec_init(&s_turn.dec). Then, on this task, pass the MP3 to
-         * tts_data() as it arrives (it buffers up to MP3_BUF and drops the
-         * rest, so hold off while it's full) and set s_turn.mp3_ended at the
-         * end. decode() plays it at the speaker's volume, captions following,
-         * and finishes the message once it's drained.
-         */
-        m.pcm_start = s_turn.pcm_out;
-        /* Paced to the text kept: a reply longer than CAPTION_TEXT shows what
-         * was kept at reading pace, not stretched over the whole reply's time
-         * (the Watcher keeps the rest for review). */
+
         size_t shown = s_turn.texts ? CAPTION_LEN(s_turn.texts + i * TEXT_MAX) : m.len;
-        m.pcm_frames = (uint32_t)(shown * MIC_RATE / TEXT_CHARS_PER_S);
+        m.pcm_start = s_turn.pcm_out;
+        m.pcm_frames = 0;
         m.tts = TTS_ACTIVE;
         s_turn.tts_msg = i;
+        s_turn.silent = false;
+        s_turn.mp3_len = 0;
+        s_turn.mp3_ended = false;
+        s_turn.kbps = 0;
+        s_turn.down_rate = 0;
+        mp3dec_init(&s_turn.dec);
+
+#if defined(CONFIG_MUSE_TTS_ENABLE) && CONFIG_MUSE_TTS_ENABLE
+        if (CONFIG_MUSE_TTS_API_KEY[0] && s_turn.texts) {
+            const char *src = s_turn.texts + i * TEXT_MAX;
+            size_t n = strnlen(src, CONFIG_MUSE_TTS_MAX_CHARS);
+            char text[CONFIG_MUSE_TTS_MAX_CHARS + 1];
+            memcpy(text, src, n);
+            text[n] = '\0';
+            while (n && (text[n - 1] == ' ' || text[n - 1] == '\n' || text[n - 1] == '\r')) {
+                text[--n] = '\0';
+            }
+
+            cJSON *root = cJSON_CreateObject();
+            char *body = nullptr;
+            if (root) {
+                cJSON_AddStringToObject(root, "model", CONFIG_MUSE_TTS_MODEL);
+                cJSON_AddStringToObject(root, "voice", CONFIG_MUSE_TTS_VOICE);
+                cJSON_AddStringToObject(root, "input", text);
+                cJSON_AddStringToObject(root, "response_format",
+                                        CONFIG_MUSE_TTS_RESPONSE_FORMAT);
+                cJSON_AddNumberToObject(root, "sample_rate", MIC_RATE);
+                body = cJSON_PrintUnformatted(root);
+                cJSON_Delete(root);
+            }
+            if (body) {
+                ESP_LOGI(TAG, "TTS: %u chars", (unsigned)n);
+                show_reply_start(m);   /* the caption shows while audio is fetched */
+                esp_http_client_config_t cfg = {};
+                cfg.url = CONFIG_MUSE_TTS_URL;
+                cfg.timeout_ms = CONFIG_MUSE_TTS_TIMEOUT_MS;
+                cfg.buffer_size = 4096;
+                cfg.buffer_size_tx = 4096;
+                cfg.event_handler = on_tts_http;
+                cfg.crt_bundle_attach = esp_crt_bundle_attach;
+                cfg.disable_auto_redirect = true;
+                cfg.method = HTTP_METHOD_POST;
+                // The hotspot's DNS often answers with IPv6 first, which this
+                // build cannot use. Force IPv4.
+                cfg.addr_type = HTTP_ADDR_TYPE_INET;
+
+                int status = 0;
+                for (int attempt = 0; attempt < 3 && status != 200; attempt++) {
+                    s_turn.mp3_len = 0;
+                    esp_http_client_handle_t c = esp_http_client_init(&cfg);
+                    if (!c) break;
+                    char auth[16 + sizeof(CONFIG_MUSE_TTS_API_KEY)];
+                    snprintf(auth, sizeof(auth), "Bearer %s", CONFIG_MUSE_TTS_API_KEY);
+                    esp_http_client_set_header(c, "Authorization", auth);
+                    esp_http_client_set_header(c, "Content-Type", "application/json");
+                    esp_http_client_set_header(
+                        c, "Accept",
+                        strcmp(CONFIG_MUSE_TTS_RESPONSE_FORMAT, "mp3") == 0
+                            ? "audio/mpeg" : "audio/wav");
+                    esp_http_client_set_post_field(c, body, strlen(body));
+                    esp_err_t err = esp_http_client_perform(c);
+                    status = esp_http_client_get_status_code(c);
+                    esp_http_client_cleanup(c);
+                    if (err != ESP_OK && status == 0) {
+                        ESP_LOGW(TAG, "TTS attempt %d failed: %s", attempt + 1,
+                                 esp_err_to_name(err));
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                    }
+                }
+                free(body);
+
+                if (status == 200 && s_turn.mp3_len > 12 &&
+                    memcmp(s_turn.mp3, "RIFF", 4) == 0) {
+                    tts_play_wav(s_turn.mp3, s_turn.mp3_len);
+                    return;
+                }
+                if (status == 200 && s_turn.mp3_len > 0) {
+                    /* The provider answered with MP3 instead of WAV. */
+                    s_turn.mp3_ended = true;
+                    return;
+                }
+                ESP_LOGW(TAG, "TTS failed (HTTP %d); showing the text", status);
+            }
+        }
+#endif
+
+        /* No key, no TTS, or the request failed: pace the caption with silence. */
+        m.pcm_start = s_turn.pcm_out;
+        m.pcm_frames = (uint32_t)(shown * MIC_RATE / TEXT_CHARS_PER_S);
         s_turn.silent = true;
         ESP_LOGI(TAG, "showing message %s (%u chars)", m.id, (unsigned)m.len);
         show_reply_start(m);
@@ -1633,6 +1711,90 @@ static void tts_data(const uint8_t *data, size_t len)
     memcpy(s_turn.mp3 + s_turn.mp3_len, data, len);
     s_turn.mp3_len += len;
 }
+
+#if defined(CONFIG_MUSE_TTS_ENABLE) && CONFIG_MUSE_TTS_ENABLE
+static esp_err_t on_tts_http(esp_http_client_event_t *evt)
+{
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->data_len > 0) {
+        tts_data(reinterpret_cast<const uint8_t *>(evt->data), evt->data_len);
+    }
+    return ESP_OK;
+}
+
+/* Plays a PCM16 WAV by resampling it to MIC_RATE into the voice task's buffer.
+ * This runs on the session task, so it paces itself against s_out. */
+static void tts_play_wav(const uint8_t *buf, size_t len)
+{
+    if (s_turn.tts_msg < 0 || len < 44) return;
+    if (memcmp(buf, "RIFF", 4) != 0 || memcmp(buf + 8, "WAVE", 4) != 0) return;
+
+    uint16_t format = 1, channels = 1, bits = 16;
+    uint32_t rate = MIC_RATE;
+    const uint8_t *data = nullptr;
+    size_t data_len = 0;
+
+    size_t off = 12;
+    while (off + 8 <= len) {
+        const uint8_t *chunk = buf + off;
+        uint32_t size = (uint32_t)chunk[4] | ((uint32_t)chunk[5] << 8) |
+                        ((uint32_t)chunk[6] << 16) | ((uint32_t)chunk[7] << 24);
+        if (memcmp(chunk, "fmt ", 4) == 0 && size >= 16 && off + 8 + 16 <= len) {
+            format = (uint16_t)(chunk[8] | (chunk[9] << 8));
+            channels = (uint16_t)(chunk[10] | (chunk[11] << 8));
+            rate = (uint32_t)chunk[12] | ((uint32_t)chunk[13] << 8) |
+                   ((uint32_t)chunk[14] << 16) | ((uint32_t)chunk[15] << 24);
+            bits = (uint16_t)(chunk[22] | (chunk[23] << 8));
+        } else if (memcmp(chunk, "data", 4) == 0) {
+            data = chunk + 8;
+            data_len = size;
+            if (off + 8 + data_len > len) data_len = len - off - 8;
+            break;
+        }
+        off += 8 + size + (size & 1);
+    }
+    if (!data || format != 1 || bits != 16 || channels < 1 || channels > 2) {
+        ESP_LOGW(TAG, "TTS WAV: unsupported (format %u, %u ch, %u bits)",
+                 format, channels, bits);
+        return;
+    }
+
+    resampler_t rs;
+    resampler_init(&rs, (int)rate, MIC_RATE);
+    const int16_t *pcm = reinterpret_cast<const int16_t *>(data);
+    size_t frames = data_len / (2 * channels);
+    size_t max_in = MINIMP3_MAX_SAMPLES_PER_FRAME;
+    if (rate && rate < MIC_RATE) {
+        max_in = (size_t)((uint64_t)MINIMP3_MAX_SAMPLES_PER_FRAME * rate / MIC_RATE);
+    }
+    size_t pos = 0;
+    while (pos < frames) {
+        size_t n = frames - pos;
+        if (n > max_in) n = max_in;
+        for (size_t k = 0; k < n; k++) {
+            int32_t v = pcm[(pos + k) * channels];
+            if (channels == 2) v = (v + pcm[(pos + k) * 2 + 1]) / 2;
+            s_pcm[k] = (int16_t)v;
+        }
+        size_t out = resample(&rs, s_pcm, n, s_pcm16);
+        if (s_turn.gen != s_gen.load()) break;
+        size_t sent = 0;
+        while (sent < out) {
+            size_t w = xStreamBufferSend(s_out, s_pcm16 + sent,
+                                         (out - sent) * sizeof(int16_t),
+                                         pdMS_TO_TICKS(100));
+            sent += w / sizeof(int16_t);
+            if (!w) vTaskDelay(1);
+        }
+        s_turn.pcm_out += (uint32_t)out;
+        pos += n;
+    }
+    msg_t &m = s_turn.msgs[s_turn.tts_msg];
+    m.pcm_frames = s_turn.pcm_out - m.pcm_start;
+    m.tts = TTS_FINISHED;
+    s_turn.tts_msg = -1;
+    s_turn.silent = false;
+}
+#endif
 
 static void tts_end(stream_t *s, bool ok)
 {

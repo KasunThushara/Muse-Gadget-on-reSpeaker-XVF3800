@@ -36,6 +36,8 @@
 #elif CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE
 #include "driver/gpio.h"
 #include "led_strip.h"
+#elif CONFIG_HOMEHUB_LED_BACKEND_XVF3800
+#include "xvf3800.h"
 #elif CONFIG_HOMEHUB_LED_BACKEND_C3_SSD1306
 #include "driver/i2c_master.h"
 #include "pixel_font.h"
@@ -115,6 +117,10 @@ static const char *TAG = "link.led";
 #endif
 #define LED_STRIP_RMT_RES_HZ (10 * 1000 * 1000)
 // How long the ring stays green after connecting before it goes dark.
+#define RING_CONNECTED_MS    3000
+#elif CONFIG_HOMEHUB_LED_BACKEND_XVF3800
+// The XVF3800 owns the ring; this is only its logical size.
+#define RING_LEDS            12
 #define RING_CONNECTED_MS    3000
 #elif CONFIG_HOMEHUB_LED_BACKEND_C3_SSD1306
 // ESP32-C3 with a 0.42 inch SSD1306 OLED on I2C: the status and the agent's
@@ -453,6 +459,56 @@ static bool led_hw_init(void) {
     }
 
     ESP_LOGI(TAG, "LED status ready: %d addressable LED(s) (GPIO=%d)", RING_LEDS, RING_GPIO);
+    return true;
+}
+#elif CONFIG_HOMEHUB_LED_BACKEND_XVF3800
+// The XVF3800 drives the 12 WS2812 LEDs itself; this backend sends it colours.
+static int s_connected_frames = 0;
+static int s_effect = -1;
+
+static void ring_effect(int effect) {
+    if (effect != s_effect && xvf3800_led_effect((uint8_t)effect) == ESP_OK) {
+        s_effect = effect;
+    }
+}
+
+static void ring_show(const rgb_t *px) {
+    uint8_t rgb[RING_LEDS * 3];
+    for (int i = 0; i < RING_LEDS; i++) {
+        rgb[3 * i] = px[i].r;
+        rgb[3 * i + 1] = px[i].g;
+        rgb[3 * i + 2] = px[i].b;
+    }
+    if (xvf3800_led_ring(rgb, RING_LEDS) == ESP_OK) ring_effect(XVF3800_LED_RING);
+}
+
+static void ring_fill(rgb_t c) {
+    rgb_t px[RING_LEDS];
+    for (int i = 0; i < RING_LEDS; i++) px[i] = c;
+    ring_show(px);
+}
+
+static void led_hw_set_color(rgb_t c) {
+    s_connected_frames = 0;
+    if (xvf3800_led_colour(c.r, c.g, c.b) == ESP_OK) ring_effect(XVF3800_LED_SOLID);
+}
+
+// Connected: green for a moment, then dark until something happens.
+static void led_hw_set_connected(void) {
+    ring_fill(s_connected_frames * 200 < RING_CONNECTED_MS ? COLOR_GREEN : COLOR_OFF);
+    if (s_connected_frames * 200 < RING_CONNECTED_MS) s_connected_frames++;
+}
+
+static bool led_hw_init(void) {
+    if (xvf3800_init() != ESP_OK) {
+        ESP_LOGE(TAG, "XVF3800 I2C init failed");
+        return false;
+    }
+    (void)xvf3800_ring_power(true);
+    (void)xvf3800_led_brightness(128);
+    (void)xvf3800_led_colour(0, 0, 0);
+    ring_effect(XVF3800_LED_SOLID);
+    ESP_LOGI(TAG, "LED status ready: XVF3800 12-LED ring (I2C 0x%02x)", XVF3800_I2C_ADDR);
     return true;
 }
 #elif CONFIG_HOMEHUB_LED_BACKEND_C3_SSD1306
@@ -1162,7 +1218,7 @@ static bool led_hw_init(void) {
 #endif
 
 #if !CONFIG_HOMEHUB_DISPLAY
-#if !(CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE)
+#if !(CONFIG_HOMEHUB_LED_BACKEND_VOICE_RING || CONFIG_HOMEHUB_LED_BACKEND_RESPEAKER_LITE || CONFIG_HOMEHUB_LED_BACKEND_XVF3800)
 static void led_hw_set_connected(void) {
     led_hw_set_color(COLOR_GREEN);
 }

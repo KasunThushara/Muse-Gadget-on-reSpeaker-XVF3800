@@ -486,6 +486,61 @@ if MUSE_REALTIME_VOICE
 
 endif
 
+    config MUSE_TTS_ENABLE
+        bool "Speak replies with a TTS API (Groq)"
+        depends on (MUSE_HATCH || HOMEHUB_VOICE) && SPIRAM
+        default n
+        help
+            Send each reply's text to a text-to-speech API and play the audio
+            it returns instead of pacing the captions with silence. Set
+            MUSE_TTS_API_KEY to your provider key. The reply is truncated to
+            MUSE_TTS_MAX_CHARS characters for providers with a short input
+            limit (Groq Orpheus allows 200).
+
+    config MUSE_TTS_URL
+        string "TTS endpoint URL"
+        depends on MUSE_TTS_ENABLE
+        default "https://api.groq.com/openai/v1/audio/speech"
+
+    config MUSE_TTS_MODEL
+        string "TTS model"
+        depends on MUSE_TTS_ENABLE
+        default "canopylabs/orpheus-v1-english"
+
+    config MUSE_TTS_VOICE
+        string "TTS voice"
+        depends on MUSE_TTS_ENABLE
+        default "alloy"
+
+    config MUSE_TTS_RESPONSE_FORMAT
+        string "TTS response format"
+        depends on MUSE_TTS_ENABLE
+        default "mp3"
+        help
+            Audio format requested from the TTS API. "mp3" uses the existing
+            MP3 decoder; "wav" uses the WAV parser kept for Groq Orpheus.
+
+    config MUSE_TTS_API_KEY
+        string "TTS API key"
+        depends on MUSE_TTS_ENABLE
+        default ""
+        help
+            Bearer key for the endpoint. For Groq this is a gsk_... key.
+            Keep it out of git: set it in the build's sdkconfig, which is
+            gitignored. An empty key leaves replies silent.
+
+    config MUSE_TTS_MAX_CHARS
+        int "Maximum characters sent to the TTS API"
+        depends on MUSE_TTS_ENABLE
+        range 1 4000
+        default 200
+
+    config MUSE_TTS_TIMEOUT_MS
+        int "TTS request timeout (ms)"
+        depends on MUSE_TTS_ENABLE
+        range 1000 60000
+        default 15000
+
     config MUSE_HATCH_COMPACT_BUFFERS
         bool "Smaller voice session buffers, for 2 MB of PSRAM"
         depends on MUSE_HATCH
